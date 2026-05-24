@@ -1,0 +1,1670 @@
+"""
+main.py — FastAPI Orchestrator
+===============================
+
+Pipeline for each TradingView alert:
+  1. Receive webhook  → verify secret
+  2. Validate symbol  → must be in ALLOWED_SYMBOLS
+  3. Fetch live quote + historical indicators (yfinance)
+  4. Pre-flight risk evaluation (risk_manager)
+  5. Claude AI analysis (claude_analyzer)
+  6. Send formatted Telegram alert (telegram_bot)
+
+Endpoints:
+  POST /webhook/tradingview   ← TradingView sends here
+  GET  /analyze/{symbol}      ← Manual on-demand analysis
+  GET  /health                ← Railway / uptime health check
+  GET  /                      ← API info
+
+Run locally:
+  uvicorn main:app --reload --port 8000
+
+Deploy (Railway):
+  Set all .env vars in Railway dashboard → push code
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+import sys
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from claude_analyzer import ClaudeAnalyzer
+from config import settings
+from market_data import MarketDataClient
+from models import (
+    AnalysisResult,
+    HealthResponse,
+    TradingViewAlert,
+    WebhookResponse,
+)
+from risk_manager import RiskManager
+from telegram_bot import TelegramBot
+
+# ── Logging ──────────────────────────────────────────────────
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)-16s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("Main")
+
+# ── Clients (module-level singletons) ────────────────────────
+market   = MarketDataClient()
+analyzer = ClaudeAnalyzer()
+telegram = TelegramBot()
+risk     = RiskManager()
+
+
+# ── Lifespan ─────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("=" * 60)
+    log.info("  AI TRADING WEBHOOK SYSTEM — starting up")
+    log.info(f"  Mode    : {'PAPER' if settings.PAPER_TRADING else '⚠️ LIVE'}")
+    log.info(f"  Model   : {settings.CLAUDE_MODEL}")
+    log.info(f"  Symbols : {settings.ALLOWED_SYMBOLS}")
+    log.info("=" * 60)
+    await telegram.send_startup()
+    yield
+    log.info("Shutting down.")
+
+
+# ── App ───────────────────────────────────────────────────────
+app = FastAPI(
+    title="AI Trading Webhook",
+    version="1.0.0",
+    description="TradingView → Claude AI → Telegram alerts for SOXL / TQQQ / SMH / QQQ",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────
+# ERROR HANDLER
+# ─────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)},
+    )
+
+
+# ─────────────────────────────────────────────
+# ENDPOINTS
+# ─────────────────────────────────────────────
+@app.get("/", response_class=JSONResponse)
+async def root():
+    return {
+        "service":      "AI Trading Webhook",
+        "version":      "1.0.0",
+        "paper_trading": settings.PAPER_TRADING,
+        "allowed_symbols": settings.ALLOWED_SYMBOLS,
+        "endpoints": {
+            "webhook": "POST /webhook/tradingview",
+            "analyze": "GET  /analyze/{symbol}",
+            "health":  "GET  /health",
+        },
+    }
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    return HealthResponse(
+        status="ok",
+        paper_trading=settings.PAPER_TRADING,
+        timestamp=datetime.utcnow().isoformat(),
+    )
+
+
+# ── Main webhook ─────────────────────────────────────────────
+@app.post("/webhook/tradingview", response_model=WebhookResponse)
+async def tradingview_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    # 1. Verify secret
+    if settings.WEBHOOK_SECRET:
+        secret = request.headers.get("X-Webhook-Secret", "")
+        if secret != settings.WEBHOOK_SECRET:
+            log.warning(f"Rejected webhook — bad secret from {request.client.host}")
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    # 2. Parse body
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # 3. Validate model
+    try:
+        alert = TradingViewAlert(**payload)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Payload validation error: {e}")
+
+    # 4. Symbol whitelist
+    if alert.symbol not in settings.ALLOWED_SYMBOLS:
+        log.info(f"Symbol {alert.symbol} not in allowed list — ignored")
+        return WebhookResponse(
+            status="ignored",
+            symbol=alert.symbol,
+            message=f"{alert.symbol} is not in ALLOWED_SYMBOLS",
+        )
+
+    log.info(f"Webhook received: {alert.symbol} | {alert.action} | ${alert.price}")
+
+    # 5. Queue analysis in background (respond fast to TradingView)
+    background_tasks.add_task(_process_alert, alert)
+
+    return WebhookResponse(
+        status="accepted",
+        symbol=alert.symbol,
+        message="Alert queued for AI analysis",
+    )
+
+
+# ── Manual analysis ──────────────────────────────────────────
+@app.get("/analyze/{symbol}")
+async def manual_analyze(symbol: str, action: Optional[str] = "ANALYZE"):
+    symbol = symbol.upper()
+    if symbol not in settings.ALLOWED_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{symbol} not in ALLOWED_SYMBOLS: {settings.ALLOWED_SYMBOLS}",
+        )
+
+    log.info(f"Manual analysis: {symbol}")
+
+    # Fetch data
+    quote = await market.get_quote(symbol)
+    hist  = await market.get_historical(symbol, days=60)
+    news  = await market.get_news(symbol, limit=8)
+    price = quote.get("price", 0.0)
+    indicators = hist.get("indicators", {})
+
+    # Risk evaluation
+    risk_ctx = risk.evaluate(
+        symbol=symbol,
+        action=action.upper(),
+        price=price,
+        indicators=indicators,
+        quote=quote,
+    )
+
+    # Claude analysis
+    result = await analyzer.analyze(
+        symbol=symbol,
+        action=action.upper(),
+        price=price,
+        quote=quote,
+        news=news,
+        indicators=indicators,
+        risk_context=risk_ctx,
+    )
+
+    # Telegram
+    await telegram.send_analysis(result)
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# BACKGROUND PIPELINE
+# ─────────────────────────────────────────────
+async def _process_alert(alert: TradingViewAlert):
+    """Full analysis pipeline — runs in background after webhook ack."""
+    try:
+        log.info(f"Processing: {alert.symbol} {alert.action}")
+
+        # ── 1. Market data ─────────────────────────────────────
+        quote, hist, news = await asyncio.gather(
+            market.get_quote(alert.symbol),
+            market.get_historical(alert.symbol, days=60),
+            market.get_news(alert.symbol, limit=8),
+        )
+
+        price      = alert.price or quote.get("price", 0.0)
+        indicators = {**hist.get("indicators", {}), **(alert.indicators or {})}
+
+        # ── 2. Risk evaluation ────────────────────────────────
+        risk_ctx = risk.evaluate(
+            symbol=alert.symbol,
+            action=alert.action,
+            price=price,
+            indicators=indicators,
+            quote=quote,
+        )
+
+        # ── 3. Momentum gate ──────────────────────────────────
+        # Quick pre-filter before calling Claude (saves API cost)
+        strength = risk_ctx.get("signal_strength", "NEUTRAL")
+        if strength == "NEUTRAL" and alert.action not in ("CLOSE", "ALERT"):
+            log.info(f"  Signal too weak ({strength}) — Claude skipped, Telegram notified")
+            await telegram.send_raw(
+                f"ℹ️ <b>{alert.symbol}</b> alert received but signal strength is <b>NEUTRAL</b>.\n"
+                f"Action: {alert.action} @ ${price:.4f} — no trade suggested."
+            )
+            return
+
+        # ── 4. Claude AI analysis ─────────────────────────────
+        analysis = await analyzer.analyze(
+            symbol=alert.symbol,
+            action=alert.action,
+            price=price,
+            quote=quote,
+            news=news,
+            indicators=indicators,
+            risk_context=risk_ctx,
+            timeframe=alert.timeframe or "1D",
+            strategy=alert.strategy,
+        )
+
+        # ── 5. Minimum momentum gate ──────────────────────────
+        score = analysis.get("momentum_score", 50)
+        if (
+            alert.action in ("BUY", "LONG")
+            and score < settings.MIN_MOMENTUM_SCORE
+        ):
+            log.info(f"  Momentum {score} < threshold {settings.MIN_MOMENTUM_SCORE} — suppressed")
+            await telegram.send_raw(
+                f"⏭ <b>{alert.symbol}</b> BUY signal suppressed\n"
+                f"Momentum score {score}/100 below threshold ({settings.MIN_MOMENTUM_SCORE}).\n"
+                f"<i>{analysis.get('reasoning','')}</i>"
+            )
+            return
+
+        # ── 6. Telegram alert ─────────────────────────────────
+        await telegram.send_trade_alert(alert, analysis)
+        log.info(
+            f"Alert sent: {alert.symbol} | score={score} | "
+            f"signal={analysis.get('overall_signal')} | risk={analysis.get('risk_level')}"
+        )
+
+    except Exception as e:
+        log.error(f"Pipeline error [{alert.symbol}]: {e}", exc_info=True)
+        await telegram.send_error(f"[{alert.symbol}] {e}", critical=False)
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=settings.PORT,
+        reload=settings.DEBUG,
+        log_level=settings.LOG_LEVEL.lower(),
+    )"""
+config.py — Environment-based configuration (Pydantic Settings v2)
+
+All values are read from environment variables or the .env file.
+Nothing is hard-coded here; see .env.example for the full list.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+from typing import List
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ── Application ─────────────────────────────────────────────
+    PORT: int = Field(default=8000)
+    DEBUG: bool = Field(default=False)
+    WEBHOOK_SECRET: str = Field(default="")   # TradingView secret header
+    LOG_LEVEL: str = Field(default="INFO")
+
+    # ── Symbols ─────────────────────────────────────────────────
+    ALLOWED_SYMBOLS: List[str] = Field(
+        default=["SOXL", "TQQQ", "QQQ", "SOXX", "NVDA"]
+    )
+
+    # ── Anthropic / Claude ───────────────────────────────────────
+    ANTHROPIC_API_KEY: str = Field(default="")
+    CLAUDE_MODEL: str = Field(default="claude-opus-4-6")
+    CLAUDE_MAX_TOKENS: int = Field(default=1500)
+    CLAUDE_TEMPERATURE: float = Field(default=0.2)
+
+    # ── Telegram ─────────────────────────────────────────────────
+    TELEGRAM_BOT_TOKEN: str = Field(default="")
+    TELEGRAM_CHAT_ID: str = Field(default="")
+    TELEGRAM_ALERT_CHAT_ID: str = Field(default="")   # Optional separate channel for alerts
+
+    # ── viaNexus ─────────────────────────────────────────────────
+    VIANEXUS_API_KEY: str = Field(default="")
+    VIANEXUS_BASE_URL: str = Field(default="https://api.vianexus.com/v1")
+    VIANEXUS_TIMEOUT: int = Field(default=10)
+
+    # ── Risk Management ──────────────────────────────────────────
+    MAX_POSITION_PCT: float = Field(default=0.10)     # 10% of portfolio per position
+    MAX_DAILY_LOSS_PCT: float = Field(default=0.02)   # 2% max daily loss
+    DEFAULT_STOP_PCT: float = Field(default=0.05)     # 5% default stop loss
+    DEFAULT_TP1_MULT: float = Field(default=1.5)      # TP1 = risk × 1.5
+    DEFAULT_TP2_MULT: float = Field(default=3.0)      # TP2 = risk × 3.0
+    VOLATILITY_THRESHOLD: float = Field(default=0.04) # 4% daily range = volatile
+    MIN_MOMENTUM_SCORE: int = Field(default=40)       # Skip signals below this
+    PAPER_TRADING: bool = Field(default=True)
+
+    # ── Cache ────────────────────────────────────────────────────
+    QUOTE_CACHE_TTL: int = Field(default=30)    # seconds
+    NEWS_CACHE_TTL: int = Field(default=300)    # 5 minutes
+
+
+settings = Settings()"""
+models.py — Pydantic v2 data models
+
+All request / response schemas used across the system.
+"""
+
+from __future__ import annotations
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
+
+
+# ─────────────────────────────────────────────
+# TradingView Webhook Payload
+# ─────────────────────────────────────────────
+class TradingViewAlert(BaseModel):
+    """
+    Expected JSON body from TradingView webhook.
+
+    Minimal TradingView alert message template:
+    {
+      "symbol": "{{ticker}}",
+      "action": "{{strategy.order.action}}",
+      "price": {{close}},
+      "volume": {{volume}},
+      "indicators": {
+        "rsi": {{plot_0}},
+        "ema20": {{plot_1}},
+        "ema50": {{plot_2}},
+        "atr": {{plot_3}},
+        "macd": {{plot_4}},
+        "signal": {{plot_5}}
+      },
+      "timeframe": "{{interval}}",
+      "strategy": "{{strategy.order.comment}}"
+    }
+    """
+    symbol: str
+    action: str                                   # BUY / SELL / CLOSE / ALERT
+    price: Optional[float] = None
+    volume: Optional[float] = None
+    timeframe: Optional[str] = "1D"
+    strategy: Optional[str] = None
+    indicators: Optional[Dict[str, float]] = Field(default_factory=dict)
+    timestamp: Optional[str] = None              # ISO string from TV
+    extra: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalise_symbol(cls, v: str) -> str:
+        return v.upper().strip().replace("NASDAQ:", "").replace("NYSE:", "")
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def normalise_action(cls, v: str) -> str:
+        return v.upper().strip()
+
+
+# ─────────────────────────────────────────────
+# Market Data
+# ─────────────────────────────────────────────
+class QuoteData(BaseModel):
+    symbol: str
+    price: float
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[float] = None
+    change_pct: Optional[float] = None
+    market_cap: Optional[float] = None
+    avg_volume: Optional[float] = None
+    timestamp: Optional[str] = None
+
+
+class NewsItem(BaseModel):
+    title: str
+    summary: Optional[str] = None
+    url: Optional[str] = None
+    source: Optional[str] = None
+    published_at: Optional[str] = None
+    sentiment_score: Optional[float] = None      # -1.0 to +1.0
+    sentiment_label: Optional[str] = None        # BULLISH / BEARISH / NEUTRAL
+
+
+# ─────────────────────────────────────────────
+# Risk Evaluation
+# ─────────────────────────────────────────────
+class RiskAssessment(BaseModel):
+    symbol: str
+    action: str
+    signal_strength: str = "NEUTRAL"             # STRONG / MODERATE / WEAK / NEUTRAL
+    risk_level: str = "MEDIUM"                   # LOW / MEDIUM / HIGH / EXTREME
+    proceed: bool = True
+    notes: List[str] = Field(default_factory=list)
+
+    # Computed price levels
+    current_price: float = 0.0
+    suggested_stop: Optional[float] = None
+    suggested_tp1: Optional[float] = None
+    suggested_tp2: Optional[float] = None
+    stop_pct: Optional[float] = None
+    tp1_pct: Optional[float] = None
+    tp2_pct: Optional[float] = None
+
+    # Volatility
+    atr: Optional[float] = None
+    daily_range_pct: Optional[float] = None
+    is_volatile: bool = False
+
+
+# ─────────────────────────────────────────────
+# Claude Analysis Result
+# ─────────────────────────────────────────────
+class AnalysisResult(BaseModel):
+    symbol: str
+    action: str
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    # Core scores
+    momentum_score: int = Field(default=50, ge=0, le=100)
+    confidence: str = "MEDIUM"                   # HIGH / MEDIUM / LOW
+    overall_signal: str = "NEUTRAL"              # STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL
+
+    # Price levels
+    current_price: float = 0.0
+    stop_loss: Optional[float] = None
+    take_profit_1: Optional[float] = None
+    take_profit_2: Optional[float] = None
+    stop_pct: Optional[float] = None
+    tp1_pct: Optional[float] = None
+    tp2_pct: Optional[float] = None
+
+    # Sentiment
+    news_sentiment: str = "NEUTRAL"              # BULLISH / BEARISH / NEUTRAL
+    sentiment_score: float = 0.0                 # -1.0 to +1.0
+    news_summary: Optional[str] = None
+
+    # Risk / Volatility
+    risk_level: str = "MEDIUM"
+    volatility_warning: Optional[str] = None
+    is_volatile: bool = False
+
+    # Analysis text
+    reasoning: Optional[str] = None
+    key_factors: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    recommendation: Optional[str] = None
+
+    # Meta
+    paper_trading: bool = True
+    model_used: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
+# API Responses
+# ─────────────────────────────────────────────
+class WebhookResponse(BaseModel):
+    status: str
+    symbol: str
+    message: str
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
+    version: str = "1.0.0"
+    paper_trading: bool = True
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())"""
+market_data.py — Market data fetcher using yfinance
+
+Provides:
+  - Real-time quote (price, volume, change %)
+  - OHLCV history (30 days, 1-day bars)
+  - Technical indicators: ATR, RSI, EMA20/50, MACD, Bollinger Bands
+  - Basic news headlines via yfinance .news
+
+All results are cached to avoid hammering Yahoo Finance.
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from cachetools import TTLCache
+
+from config import settings
+
+log = logging.getLogger("MarketData")
+
+# ── In-memory cache ──────────────────────────────────────────
+_quote_cache: TTLCache = TTLCache(maxsize=50, ttl=settings.QUOTE_CACHE_TTL)
+_news_cache:  TTLCache = TTLCache(maxsize=50, ttl=settings.NEWS_CACHE_TTL)
+_hist_cache:  TTLCache = TTLCache(maxsize=20, ttl=120)   # 2-minute hist cache
+
+
+# ─────────────────────────────────────────────
+# HELPERS — Technical Indicators
+# ─────────────────────────────────────────────
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, prev_close = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    fast  = _ema(series, 12)
+    slow  = _ema(series, 26)
+    macd  = fast - slow
+    sig   = _ema(macd, 9)
+    hist  = macd - sig
+    return macd, sig, hist
+
+
+def _bollinger(series: pd.Series, period: int = 20) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid   = series.rolling(period).mean()
+    std   = series.rolling(period).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    return upper, mid, lower
+
+
+def _chop(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Choppiness Index — high = choppy, low = trending."""
+    atr_sum = _atr(df, 1).rolling(period).sum()
+    hi      = df["High"].rolling(period).max()
+    lo      = df["Low"].rolling(period).min()
+    chop    = 100 * np.log10(atr_sum / (hi - lo).replace(0, np.nan)) / np.log10(period)
+    return chop
+
+
+def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    """Return a flat dict of the latest indicator values."""
+    if df is None or len(df) < 30:
+        return {}
+
+    close = df["Close"]
+    last  = close.iloc[-1]
+
+    rsi_s  = _rsi(close)
+    atr_s  = _atr(df)
+    ema20  = _ema(close, 20)
+    ema50  = _ema(close, 50)
+    macd_l, sig_l, hist_l = _macd(close)
+    bb_up, bb_mid, bb_lo  = _bollinger(close)
+    chop_s = _chop(df)
+
+    # Volume ratio vs 20-day avg
+    vol_avg   = df["Volume"].rolling(20).mean().iloc[-1]
+    vol_ratio = df["Volume"].iloc[-1] / vol_avg if vol_avg else 1.0
+
+    # Daily range %
+    daily_range_pct = (df["High"].iloc[-1] - df["Low"].iloc[-1]) / last * 100
+
+    return {
+        "rsi":             round(float(rsi_s.iloc[-1]),  2),
+        "ema20":           round(float(ema20.iloc[-1]),  4),
+        "ema50":           round(float(ema50.iloc[-1]),  4),
+        "atr":             round(float(atr_s.iloc[-1]),  4),
+        "atr_pct":         round(float(atr_s.iloc[-1]) / last * 100, 3),
+        "macd":            round(float(macd_l.iloc[-1]), 4),
+        "macd_signal":     round(float(sig_l.iloc[-1]),  4),
+        "macd_hist":       round(float(hist_l.iloc[-1]), 4),
+        "bb_upper":        round(float(bb_up.iloc[-1]),  4),
+        "bb_mid":          round(float(bb_mid.iloc[-1]), 4),
+        "bb_lower":        round(float(bb_lo.iloc[-1]),  4),
+        "chop":            round(float(chop_s.iloc[-1]), 2),
+        "volume_ratio":    round(float(vol_ratio),       2),
+        "daily_range_pct": round(float(daily_range_pct), 3),
+        "price_vs_ema20":  round((last - float(ema20.iloc[-1])) / float(ema20.iloc[-1]) * 100, 2),
+        "price_vs_ema50":  round((last - float(ema50.iloc[-1])) / float(ema50.iloc[-1]) * 100, 2),
+    }
+
+
+# ─────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────
+class MarketDataClient:
+
+    # ── Quote ──────────────────────────────────────────────────
+    async def get_quote(self, symbol: str) -> Dict[str, Any]:
+        if symbol in _quote_cache:
+            return _quote_cache[symbol]
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, self._fetch_quote, symbol
+        )
+        _quote_cache[symbol] = result
+        return result
+
+    def _fetch_quote(self, symbol: str) -> Dict[str, Any]:
+        try:
+            tk = yf.Ticker(symbol)
+            info = tk.fast_info
+            hist = tk.history(period="2d", interval="1d")
+
+            price      = float(getattr(info, "last_price",        0) or 0)
+            prev_close = float(getattr(info, "previous_close",    0) or 0)
+            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
+
+            row = hist.iloc[-1] if not hist.empty else {}
+            return {
+                "symbol":      symbol,
+                "price":       round(price, 4),
+                "open":        round(float(row.get("Open",  price)), 4),
+                "high":        round(float(row.get("High",  price)), 4),
+                "low":         round(float(row.get("Low",   price)), 4),
+                "close":       round(float(row.get("Close", price)), 4),
+                "volume":      int(row.get("Volume", 0)),
+                "change_pct":  round(change_pct, 3),
+                "market_cap":  getattr(info, "market_cap", None),
+                "timestamp":   datetime.utcnow().isoformat(),
+            }
+        except Exception as e:
+            log.warning(f"Quote fetch failed for {symbol}: {e}")
+            return {"symbol": symbol, "price": 0.0}
+
+    # ── Historical OHLCV + indicators ──────────────────────────
+    async def get_historical(self, symbol: str, days: int = 60) -> Dict[str, Any]:
+        cache_key = f"{symbol}_{days}"
+        if cache_key in _hist_cache:
+            return _hist_cache[cache_key]
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, self._fetch_historical, symbol, days
+        )
+        _hist_cache[cache_key] = result
+        return result
+
+    def _fetch_historical(self, symbol: str, days: int) -> Dict[str, Any]:
+        try:
+            tk   = yf.Ticker(symbol)
+            df   = tk.history(period=f"{days}d", interval="1d")
+            if df.empty:
+                return {"symbol": symbol, "indicators": {}}
+
+            df.index = pd.to_datetime(df.index)
+            indicators = compute_indicators(df)
+
+            recent = df.tail(5)[["Open","High","Low","Close","Volume"]].round(4)
+            return {
+                "symbol":     symbol,
+                "bars":       recent.to_dict(orient="records"),
+                "indicators": indicators,
+            }
+        except Exception as e:
+            log.warning(f"Historical fetch failed for {symbol}: {e}")
+            return {"symbol": symbol, "indicators": {}}
+
+    # ── News ───────────────────────────────────────────────────
+    async def get_news(self, symbol: str, limit: int = 8) -> List[Dict[str, Any]]:
+        if symbol in _news_cache:
+            return _news_cache[symbol][:limit]
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, self._fetch_news, symbol, limit
+        )
+        _news_cache[symbol] = result
+        return result
+
+    def _fetch_news(self, symbol: str, limit: int) -> List[Dict[str, Any]]:
+        try:
+            tk    = yf.Ticker(symbol)
+            items = tk.news or []
+            news  = []
+            for n in items[:limit]:
+                content = n.get("content", {})
+                title   = (
+                    content.get("title")
+                    or n.get("title", "")
+                )
+                summary = (
+                    content.get("summary")
+                    or content.get("description")
+                    or ""
+                )
+                source_info = content.get("provider", {}) or {}
+                source = (
+                    source_info.get("displayName")
+                    or n.get("source", "")
+                )
+                pub = (
+                    content.get("pubDate")
+                    or content.get("displayTime")
+                    or ""
+                )
+                url = ""
+                for link_obj in (content.get("clickThroughUrl") or []):
+                    url = link_obj.get("url", "") if isinstance(link_obj, dict) else str(link_obj)
+                    break
+
+                if title:
+                    news.append({
+                        "title":        title,
+                        "summary":      summary[:300] if summary else "",
+                        "source":       source,
+                        "published_at": pub,
+                        "url":          url,
+                    })
+            return news
+        except Exception as e:
+            log.warning(f"News fetch failed for {symbol}: {e}")
+            return []"""
+claude_analyzer.py — Claude AI Analysis Engine
+
+Sends enriched market context to Claude and receives a structured
+JSON analysis containing:
+  - momentum_score       (0–100)
+  - overall_signal       (STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL)
+  - confidence           (HIGH / MEDIUM / LOW)
+  - stop_loss / tp1 / tp2 price levels
+  - news_sentiment       (BULLISH / BEARISH / NEUTRAL)
+  - volatility_warning   (string or null)
+  - risk_level           (LOW / MEDIUM / HIGH / EXTREME)
+  - key_factors          (list of strings)
+  - risks                (list of strings)
+  - reasoning            (short paragraph)
+  - recommendation       (one-sentence action)
+"""
+
+from __future__ import annotations
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+import anthropic
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from config import settings
+
+log = logging.getLogger("ClaudeAnalyzer")
+
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+# ─────────────────────────────────────────────
+# PROMPT BUILDER
+# ─────────────────────────────────────────────
+_SYSTEM_PROMPT = """You are an expert quantitative trading analyst specialising in leveraged ETFs,
+specifically SOXL (3× semiconductor), TQQQ (3× Nasdaq-100), SMH (semiconductor ETF) and QQQ (Nasdaq-100).
+
+Your job is to evaluate inbound TradingView alerts enriched with live market data and return a
+precise, structured JSON analysis. You must be data-driven, concise, and never speculative.
+
+IMPORTANT RULES:
+1. Always return ONLY valid JSON — no markdown fences, no extra commentary.
+2. For leveraged ETFs (SOXL, TQQQ): tighten stops and reduce risk ratings by one tier vs. unleveraged.
+3. Momentum score: 0 = extreme sell, 50 = neutral, 100 = extreme buy.
+4. Stop loss must ALWAYS be set — default to ATR×2 below entry when not obvious.
+5. TP1 = stop_distance × 1.5 above entry; TP2 = stop_distance × 3.0 above entry (for BUY).
+6. If volatility is HIGH/EXTREME, set volatility_warning to a concise string; otherwise null.
+7. This system is for educational/paper trading analysis only. State that in recommendation.
+
+OUTPUT SCHEMA (return exactly this shape):
+{
+  "momentum_score": <int 0-100>,
+  "overall_signal": "<STRONG_BUY|BUY|NEUTRAL|SELL|STRONG_SELL>",
+  "confidence": "<HIGH|MEDIUM|LOW>",
+  "stop_loss": <float>,
+  "take_profit_1": <float>,
+  "take_profit_2": <float>,
+  "stop_pct": <float>,
+  "tp1_pct": <float>,
+  "tp2_pct": <float>,
+  "news_sentiment": "<BULLISH|BEARISH|NEUTRAL>",
+  "sentiment_score": <float -1.0 to 1.0>,
+  "news_summary": "<one sentence>",
+  "risk_level": "<LOW|MEDIUM|HIGH|EXTREME>",
+  "volatility_warning": <string or null>,
+  "key_factors": ["<factor1>", "<factor2>", "<factor3>"],
+  "risks": ["<risk1>", "<risk2>"],
+  "reasoning": "<2–3 sentence analysis>",
+  "recommendation": "<one-sentence action for paper trading>"
+}"""
+
+
+def _build_user_prompt(
+    symbol: str,
+    action: str,
+    price: float,
+    quote: Dict[str, Any],
+    indicators: Dict[str, Any],
+    news: List[Dict[str, Any]],
+    risk_context: Dict[str, Any],
+    timeframe: str = "1D",
+    strategy: Optional[str] = None,
+) -> str:
+
+    ind_block = "\n".join(
+        f"  {k}: {v}" for k, v in indicators.items()
+    ) if indicators else "  (none provided)"
+
+    news_block = "\n".join(
+        f"  [{i+1}] {n.get('title','')[:120]} — {n.get('source','')}"
+        for i, n in enumerate(news[:6])
+    ) if news else "  (no recent news)"
+
+    risk_block = "\n".join(
+        f"  {k}: {v}" for k, v in risk_context.items()
+    ) if risk_context else "  (none)"
+
+    tv_extra = ""
+    if strategy:
+        tv_extra = f"\nStrategy/comment: {strategy}"
+
+    return f"""=== TRADINGVIEW ALERT ===
+Symbol    : {symbol}
+Action    : {action}
+Price     : ${price:.4f}
+Timeframe : {timeframe}{tv_extra}
+
+=== LIVE QUOTE ===
+  Open        : ${quote.get('open', 'n/a')}
+  High        : ${quote.get('high', 'n/a')}
+  Low         : ${quote.get('low', 'n/a')}
+  Close       : ${quote.get('close', 'n/a')}
+  Volume      : {quote.get('volume', 'n/a'):,} (if int)
+  Change %    : {quote.get('change_pct', 0):+.2f}%
+
+=== TECHNICAL INDICATORS ===
+{ind_block}
+
+=== RECENT NEWS ===
+{news_block}
+
+=== RISK CONTEXT ===
+{risk_block}
+
+Analyse this alert and return the JSON schema exactly as specified in the system prompt."""
+
+
+# ─────────────────────────────────────────────
+# ANALYZER
+# ─────────────────────────────────────────────
+class ClaudeAnalyzer:
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+    )
+    async def analyze(
+        self,
+        symbol: str,
+        action: str,
+        price: float,
+        quote: Dict[str, Any],
+        news: List[Dict[str, Any]],
+        indicators: Dict[str, Any],
+        risk_context: Optional[Dict[str, Any]] = None,
+        timeframe: str = "1D",
+        strategy: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Call Claude and return the structured analysis dict.
+        Falls back to a safe default if parsing fails.
+        """
+        prompt = _build_user_prompt(
+            symbol=symbol,
+            action=action,
+            price=price,
+            quote=quote,
+            indicators=indicators,
+            news=news,
+            risk_context=risk_context or {},
+            timeframe=timeframe,
+            strategy=strategy,
+        )
+
+        log.info(f"Sending {symbol} {action} @ ${price:.2f} to Claude…")
+
+        try:
+            response = _client.messages.create(
+                model=settings.CLAUDE_MODEL,
+                max_tokens=settings.CLAUDE_MAX_TOKENS,
+                temperature=settings.CLAUDE_TEMPERATURE,
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
+
+            # Strip markdown fences if Claude adds them anyway
+            raw = re.sub(r"^```(?:json)?", "", raw).strip()
+            raw = re.sub(r"```$",          "", raw).strip()
+
+            analysis = json.loads(raw)
+            analysis["symbol"]       = symbol
+            analysis["action"]       = action
+            analysis["current_price"] = price
+            analysis["model_used"]   = settings.CLAUDE_MODEL
+            analysis["paper_trading"] = settings.PAPER_TRADING
+
+            log.info(
+                f"Analysis: {symbol} score={analysis.get('momentum_score')} "
+                f"signal={analysis.get('overall_signal')} "
+                f"risk={analysis.get('risk_level')}"
+            )
+            return analysis
+
+        except json.JSONDecodeError as e:
+            log.error(f"Claude JSON parse error: {e} | raw={raw[:300]}")
+            return self._fallback(symbol, action, price)
+        except Exception as e:
+            log.error(f"Claude API error: {e}")
+            return self._fallback(symbol, action, price)
+
+    @staticmethod
+    def _fallback(symbol: str, action: str, price: float) -> Dict[str, Any]:
+        """Return a neutral, safe default when Claude is unreachable."""
+        stop  = round(price * 0.95, 4)
+        tp1   = round(price * 1.075, 4)
+        tp2   = round(price * 1.15,  4)
+        return {
+            "symbol":            symbol,
+            "action":            action,
+            "current_price":     price,
+            "momentum_score":    50,
+            "overall_signal":    "NEUTRAL",
+            "confidence":        "LOW",
+            "stop_loss":         stop,
+            "take_profit_1":     tp1,
+            "take_profit_2":     tp2,
+            "stop_pct":          -5.0,
+            "tp1_pct":           7.5,
+            "tp2_pct":           15.0,
+            "news_sentiment":    "NEUTRAL",
+            "sentiment_score":   0.0,
+            "news_summary":      "Analysis unavailable — Claude API error.",
+            "risk_level":        "HIGH",
+            "volatility_warning": "Analysis failed; treat all levels as estimates.",
+            "key_factors":       ["Claude API unavailable"],
+            "risks":             ["Unable to complete AI analysis"],
+            "reasoning":         "Fallback values used due to API error.",
+            "recommendation":    "Do not trade — analysis incomplete.",
+            "paper_trading":     settings.PAPER_TRADING,
+            "model_used":        "fallback",
+        }"""
+risk_manager.py — Pre-signal Risk Evaluation
+
+Computes:
+  - Signal strength from indicator context
+  - ATR-based stop-loss / take-profit levels
+  - Volatility flag
+  - Risk tier (LOW / MEDIUM / HIGH / EXTREME)
+  - Proceed / block decision based on config thresholds
+
+This runs BEFORE Claude so Claude receives enriched context.
+"""
+
+from __future__ import annotations
+import logging
+from typing import Any, Dict, Optional, Tuple
+
+from config import settings
+
+log = logging.getLogger("RiskManager")
+
+# ── Leveraged ETF multipliers ────────────────────────────────
+_LEVERAGE = {
+    "SOXL": 3,
+    "TQQQ": 3,
+    "TECL": 3,
+    "UPRO": 3,
+    "SPXL": 3,
+    "SMH":  1,
+    "QQQ":  1,
+    "SOXX": 1,
+}
+
+
+def _leverage(symbol: str) -> int:
+    return _LEVERAGE.get(symbol.upper(), 1)
+
+
+class RiskManager:
+
+    def evaluate(
+        self,
+        symbol: str,
+        action: str,
+        price: float,
+        indicators: Dict[str, Any],
+        quote: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Returns a risk context dict that is passed to Claude and the
+        Telegram formatter.
+        """
+        lev   = _leverage(symbol)
+        notes: list[str] = []
+
+        # ── ATR-based price levels ─────────────────────────────
+        atr         = indicators.get("atr", price * settings.DEFAULT_STOP_PCT)
+        atr_pct     = indicators.get("atr_pct", settings.DEFAULT_STOP_PCT * 100)
+        atr_mult    = 1.5 + (lev - 1) * 0.25      # wider stop for leveraged
+        stop_dist   = atr * atr_mult
+
+        if action in ("BUY", "LONG"):
+            suggested_stop = round(price - stop_dist, 4)
+            suggested_tp1  = round(price + stop_dist * settings.DEFAULT_TP1_MULT, 4)
+            suggested_tp2  = round(price + stop_dist * settings.DEFAULT_TP2_MULT, 4)
+        elif action in ("SELL", "SHORT"):
+            suggested_stop = round(price + stop_dist, 4)
+            suggested_tp1  = round(price - stop_dist * settings.DEFAULT_TP1_MULT, 4)
+            suggested_tp2  = round(price - stop_dist * settings.DEFAULT_TP2_MULT, 4)
+        else:
+            suggested_stop = round(price * (1 - settings.DEFAULT_STOP_PCT), 4)
+            suggested_tp1  = round(price * (1 + settings.DEFAULT_STOP_PCT * settings.DEFAULT_TP1_MULT), 4)
+            suggested_tp2  = round(price * (1 + settings.DEFAULT_STOP_PCT * settings.DEFAULT_TP2_MULT), 4)
+
+        stop_pct = round((suggested_stop - price) / price * 100, 2)
+        tp1_pct  = round((suggested_tp1  - price) / price * 100, 2)
+        tp2_pct  = round((suggested_tp2  - price) / price * 100, 2)
+
+        # ── Volatility ─────────────────────────────────────────
+        daily_range_pct = indicators.get("daily_range_pct", atr_pct)
+        is_volatile     = daily_range_pct > settings.VOLATILITY_THRESHOLD * 100
+        if is_volatile:
+            notes.append(f"High volatility: daily range {daily_range_pct:.1f}% (threshold {settings.VOLATILITY_THRESHOLD*100:.0f}%)")
+
+        # ── RSI extremes ───────────────────────────────────────
+        rsi = indicators.get("rsi")
+        if rsi is not None:
+            if rsi > 80:
+                notes.append(f"RSI overbought: {rsi:.0f}")
+            elif rsi < 25:
+                notes.append(f"RSI oversold: {rsi:.0f}")
+
+        # ── Trend alignment ────────────────────────────────────
+        ema20 = indicators.get("ema20")
+        ema50 = indicators.get("ema50")
+        if ema20 and ema50:
+            if action in ("BUY", "LONG") and price < ema20:
+                notes.append("Price below EMA20 — counter-trend BUY")
+            if action in ("BUY", "LONG") and ema20 < ema50:
+                notes.append("EMA20 < EMA50 — short-term downtrend")
+
+        # ── Volume ─────────────────────────────────────────────
+        vol_ratio = indicators.get("volume_ratio", 1.0)
+        if vol_ratio > 2.5:
+            notes.append(f"Volume spike: {vol_ratio:.1f}× average")
+        elif vol_ratio < 0.5:
+            notes.append(f"Low volume: {vol_ratio:.1f}× average — weak conviction")
+
+        # ── MACD ──────────────────────────────────────────────
+        macd_hist = indicators.get("macd_hist")
+        if macd_hist is not None:
+            direction = "bullish" if macd_hist > 0 else "bearish"
+            notes.append(f"MACD histogram: {macd_hist:+.4f} ({direction})")
+
+        # ── Choppiness ────────────────────────────────────────
+        chop = indicators.get("chop")
+        if chop is not None and chop > 61.8:
+            notes.append(f"Choppiness Index {chop:.1f} — sideways market, low trend strength")
+
+        # ── Risk tier ─────────────────────────────────────────
+        risk_level = self._risk_tier(
+            atr_pct=daily_range_pct,
+            leverage=lev,
+            rsi=rsi,
+            is_volatile=is_volatile,
+            n_notes=len(notes),
+        )
+
+        # ── Signal strength ───────────────────────────────────
+        signal_strength = self._signal_strength(indicators, action)
+
+        return {
+            "leverage":         lev,
+            "is_leveraged":     lev > 1,
+            "risk_level":       risk_level,
+            "signal_strength":  signal_strength,
+            "suggested_stop":   suggested_stop,
+            "suggested_tp1":    suggested_tp1,
+            "suggested_tp2":    suggested_tp2,
+            "stop_pct":         stop_pct,
+            "tp1_pct":          tp1_pct,
+            "tp2_pct":          tp2_pct,
+            "atr":              round(atr, 4),
+            "atr_pct":          round(atr_pct, 3),
+            "daily_range_pct":  round(daily_range_pct, 3),
+            "is_volatile":      is_volatile,
+            "volume_ratio":     round(vol_ratio, 2),
+            "notes":            notes,
+        }
+
+    # ── Helpers ────────────────────────────────────────────────
+    @staticmethod
+    def _risk_tier(
+        atr_pct: float,
+        leverage: int,
+        rsi: Optional[float],
+        is_volatile: bool,
+        n_notes: int,
+    ) -> str:
+        score = 0
+        score += min(atr_pct / 1.0, 4)       # up to 4 pts for volatility
+        score += (leverage - 1) * 1.5         # 3× ETF adds 3 pts
+        if is_volatile:
+            score += 2
+        if rsi and (rsi > 80 or rsi < 20):
+            score += 1
+        score += min(n_notes * 0.5, 2)
+
+        if score >= 8:
+            return "EXTREME"
+        if score >= 5:
+            return "HIGH"
+        if score >= 2.5:
+            return "MEDIUM"
+        return "LOW"
+
+    @staticmethod
+    def _signal_strength(indicators: Dict[str, Any], action: str) -> str:
+        score = 0
+        rsi        = indicators.get("rsi")
+        macd_hist  = indicators.get("macd_hist")
+        vol_ratio  = indicators.get("volume_ratio", 1.0)
+        p_ema20    = indicators.get("price_vs_ema20", 0)
+        p_ema50    = indicators.get("price_vs_ema50", 0)
+
+        if action in ("BUY", "LONG"):
+            if rsi and 40 < rsi < 65:    score += 2
+            if macd_hist and macd_hist > 0:  score += 2
+            if vol_ratio > 1.5:          score += 1
+            if p_ema20 > 0:              score += 1
+            if p_ema50 > 0:              score += 1
+        elif action in ("SELL", "SHORT"):
+            if rsi and rsi > 70:         score += 2
+            if macd_hist and macd_hist < 0:  score += 2
+            if vol_ratio > 1.5:          score += 1
+            if p_ema20 < 0:              score += 1
+            if p_ema50 < 0:              score += 1
+
+        if score >= 6:  return "STRONG"
+        if score >= 4:  return "MODERATE"
+        if score >= 2:  return "WEAK"
+        return "NEUTRAL""""
+telegram_bot.py — Formatted Telegram Alert Sender
+
+Message types:
+  1. Trade alert  — full analysis breakdown with price levels
+  2. Error alert  — system error notification
+  3. Startup      — bot online confirmation
+  4. Manual query — on-demand symbol summary
+"""
+
+from __future__ import annotations
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+import httpx
+
+from config import settings
+
+log = logging.getLogger("Telegram")
+
+# ── Emoji maps ───────────────────────────────────────────────
+_SIGNAL_EMOJI = {
+    "STRONG_BUY":  "🚀",
+    "BUY":         "📈",
+    "NEUTRAL":     "➡️",
+    "SELL":        "📉",
+    "STRONG_SELL": "🔻",
+}
+_RISK_EMOJI = {
+    "LOW":     "🟢",
+    "MEDIUM":  "🟡",
+    "HIGH":    "🟠",
+    "EXTREME": "🔴",
+}
+_SENTIMENT_EMOJI = {
+    "BULLISH": "📰🟢",
+    "BEARISH": "📰🔴",
+    "NEUTRAL": "📰⚪",
+}
+_CONF_EMOJI = {
+    "HIGH":   "🎯",
+    "MEDIUM": "🔍",
+    "LOW":    "❓",
+}
+_ACTION_EMOJI = {
+    "BUY":   "🟢 BUY",
+    "SELL":  "🔴 SELL",
+    "CLOSE": "🔒 CLOSE",
+    "ALERT": "📌 ALERT",
+    "LONG":  "🟢 LONG",
+    "SHORT": "🔴 SHORT",
+}
+
+
+def _score_bar(score: int) -> str:
+    """Visual progress bar for momentum score."""
+    filled = round(score / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+    return f"[{bar}] {score}/100"
+
+
+def _pct(val: Optional[float], prefix: bool = True) -> str:
+    if val is None:
+        return "n/a"
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{val:.2f}%"
+
+
+class TelegramBot:
+
+    def __init__(self):
+        self._token   = settings.TELEGRAM_BOT_TOKEN
+        self._chat    = settings.TELEGRAM_CHAT_ID
+        self._alert   = settings.TELEGRAM_ALERT_CHAT_ID or settings.TELEGRAM_CHAT_ID
+        self._base    = f"https://api.telegram.org/bot{self._token}"
+        self._enabled = bool(self._token and self._chat and not self._token.startswith("123"))
+
+    # ─────────────────────────────────────────────
+    # PUBLIC METHODS
+    # ─────────────────────────────────────────────
+    async def send_trade_alert(
+        self,
+        alert: Any,            # TradingViewAlert
+        analysis: Dict[str, Any],
+    ) -> bool:
+        """Main trade alert with full analysis breakdown."""
+        msg = self._build_trade_message(alert, analysis)
+        return await self._send(msg, chat_id=self._alert, disable_preview=True)
+
+    async def send_analysis(self, analysis: Dict[str, Any]) -> bool:
+        """Manual /analyze result."""
+        msg = self._build_analysis_message(analysis)
+        return await self._send(msg, chat_id=self._chat, disable_preview=True)
+
+    async def send_startup(self) -> bool:
+        mode = "📄 PAPER" if settings.PAPER_TRADING else "💵 LIVE"
+        msg = (
+            f"🤖 <b>AI Trading Bot Online</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Mode      : {mode}\n"
+            f"Symbols   : {', '.join(settings.ALLOWED_SYMBOLS)}\n"
+            f"Model     : {settings.CLAUDE_MODEL}\n"
+            f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Webhook ready at <code>/webhook/tradingview</code>"
+        )
+        return await self._send(msg, chat_id=self._chat)
+
+    async def send_error(self, error: str, critical: bool = False) -> bool:
+        icon = "🚨" if critical else "⚠️"
+        label = "CRITICAL ERROR" if critical else "Error"
+        msg = (
+            f"{icon} <b>{label}</b>\n"
+            f"<code>{error[:400]}</code>\n"
+            f"<i>{datetime.utcnow().strftime('%H:%M:%S')} UTC</i>"
+        )
+        return await self._send(msg, chat_id=self._chat)
+
+    async def send_raw(self, text: str) -> bool:
+        return await self._send(text, chat_id=self._chat)
+
+    # ─────────────────────────────────────────────
+    # MESSAGE BUILDERS
+    # ─────────────────────────────────────────────
+    def _build_trade_message(
+        self,
+        alert: Any,
+        a: Dict[str, Any],
+    ) -> str:
+        symbol   = a.get("symbol",        alert.symbol)
+        action   = a.get("action",        alert.action)
+        price    = a.get("current_price", alert.price or 0)
+        signal   = a.get("overall_signal", "NEUTRAL")
+        conf     = a.get("confidence",    "MEDIUM")
+        score    = a.get("momentum_score", 50)
+        risk     = a.get("risk_level",    "MEDIUM")
+        news_s   = a.get("news_sentiment","NEUTRAL")
+        mode     = "📄 PAPER" if settings.PAPER_TRADING else "💵 LIVE"
+
+        # Price levels
+        stop  = a.get("stop_loss")
+        tp1   = a.get("take_profit_1")
+        tp2   = a.get("take_profit_2")
+        s_pct = a.get("stop_pct")
+        t1pct = a.get("tp1_pct")
+        t2pct = a.get("tp2_pct")
+
+        # Volatility
+        vol_warn = a.get("volatility_warning")
+        vol_line = f"\n⚡ <b>Volatility:</b> {vol_warn}" if vol_warn else ""
+
+        # Key factors
+        factors = a.get("key_factors", [])
+        fac_str = "\n".join(f"  • {f}" for f in factors[:4]) if factors else "  —"
+
+        # Risks
+        risks = a.get("risks", [])
+        ris_str = "\n".join(f"  ⚠ {r}" for r in risks[:3]) if risks else "  —"
+
+        # Recommendation
+        rec = a.get("recommendation", "")
+
+        # News summary
+        news_sum = a.get("news_summary", "")
+
+        sep = "━━━━━━━━━━━━━━━━━━━━"
+
+        lines = [
+            f"{_SIGNAL_EMOJI.get(signal,'📌')} <b>{_ACTION_EMOJI.get(action, action)}</b>  —  <b>{symbol}</b>  {mode}",
+            sep,
+            f"💰 Entry     : <b>${price:.4f}</b>",
+            f"🛑 Stop Loss : ${stop:.4f}  ({_pct(s_pct)})" if stop else "",
+            f"🎯 TP1       : ${tp1:.4f}  ({_pct(t1pct)})"  if tp1  else "",
+            f"🏆 TP2       : ${tp2:.4f}  ({_pct(t2pct)})"  if tp2  else "",
+            sep,
+            f"📊 Momentum  : {_score_bar(score)}",
+            f"{_CONF_EMOJI.get(conf,'🔍')} Confidence : {conf}",
+            f"{_RISK_EMOJI.get(risk,'🟡')} Risk Level : {risk}",
+            f"{_SENTIMENT_EMOJI.get(news_s,'📰⚪')} News       : {news_s}",
+            vol_line,
+            sep,
+            "<b>Key Factors</b>",
+            fac_str,
+            "",
+            "<b>Risks</b>",
+            ris_str,
+            sep,
+            f"💡 <i>{rec}</i>" if rec else "",
+            f"📝 <i>{news_sum}</i>" if news_sum else "",
+            "",
+            f"<i>Signal: {a.get('overall_signal')} | TF: {alert.timeframe or '1D'} | "
+            f"{datetime.utcnow().strftime('%H:%M')} UTC</i>",
+        ]
+
+        return "\n".join(l for l in lines if l != "")
+
+    def _build_analysis_message(self, a: Dict[str, Any]) -> str:
+        symbol = a.get("symbol", "?")
+        price  = a.get("current_price", 0)
+        signal = a.get("overall_signal", "NEUTRAL")
+        score  = a.get("momentum_score", 50)
+        risk   = a.get("risk_level", "MEDIUM")
+        mode   = "📄 PAPER" if settings.PAPER_TRADING else "💵 LIVE"
+        reasoning = a.get("reasoning", "")
+
+        sep = "━━━━━━━━━━━━━━━━━━━━"
+
+        return (
+            f"🔎 <b>Manual Analysis — {symbol}</b>  {mode}\n"
+            f"{sep}\n"
+            f"💰 Price    : <b>${price:.4f}</b>\n"
+            f"{_SIGNAL_EMOJI.get(signal,'📌')} Signal  : <b>{signal}</b>\n"
+            f"📊 Momentum : {_score_bar(score)}\n"
+            f"{_RISK_EMOJI.get(risk,'🟡')} Risk    : {risk}\n"
+            f"{sep}\n"
+            f"🛑 Stop Loss: ${a.get('stop_loss', 'n/a')}\n"
+            f"🎯 TP1      : ${a.get('take_profit_1', 'n/a')}\n"
+            f"🏆 TP2      : ${a.get('take_profit_2', 'n/a')}\n"
+            f"{sep}\n"
+            f"<i>{reasoning}</i>\n"
+            f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</i>"
+        )
+
+    # ─────────────────────────────────────────────
+    # HTTP SENDER
+    # ─────────────────────────────────────────────
+    async def _send(
+        self,
+        text: str,
+        chat_id: str = "",
+        disable_preview: bool = False,
+    ) -> bool:
+        if not self._enabled:
+            log.warning("Telegram not configured — message suppressed.")
+            log.info(f"[TELEGRAM MOCK]\n{text}")
+            return False
+
+        target = chat_id or self._chat
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.post(
+                    f"{self._base}/sendMessage",
+                    json={
+                        "chat_id":                  target,
+                        "text":                     text,
+                        "parse_mode":               "HTML",
+                        "disable_web_page_preview": disable_preview,
+                    },
+                )
+            if not resp.is_success:
+                log.warning(f"Telegram error {resp.status_code}: {resp.text[:200]}")
+            return resp.is_success
+        except Exception as e:
+            log.error(f"Telegram send failed: {e}")
+            return False# AI Trading Webhook System — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+
+# HTTP client
+httpx==0.27.2
+
+# Pydantic v2 + settings
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Anthropic Claude SDK
+anthropic==0.40.0
+
+# Telegram
+python-telegram-bot==21.7
+
+# Market data (free, no API key needed)
+yfinance==0.2.47
+pandas==2.2.3
+numpy==2.1.3
+
+# Retry / cache
+tenacity==9.0.0
+cachetools==5.5.0
+
+# Env
+python-dotenv==1.0.1
+pytz==2024.2# ─────────────────────────────────────────────────────────────
+# AI Trading Webhook System — Environment Variables
+# Copy to .env and fill in your real values.
+# NEVER commit .env to source control.
+# ─────────────────────────────────────────────────────────────
+
+# ── App ──────────────────────────────────────────────────────
+PORT=8000
+DEBUG=false
+LOG_LEVEL=INFO
+
+# Secret header value TradingView sends with each webhook.
+# Set this in TradingView → Alert → Webhook → Header: X-Webhook-Secret
+WEBHOOK_SECRET=your_secret_token_here
+
+# ── Trading Mode ─────────────────────────────────────────────
+PAPER_TRADING=true        # Set to false for live signal tracking
+
+# ── Anthropic / Claude ───────────────────────────────────────
+ANTHROPIC_API_KEY=sk-ant-xxxxxx
+CLAUDE_MODEL=claude-opus-4-6
+CLAUDE_MAX_TOKENS=1500
+CLAUDE_TEMPERATURE=0.2
+
+# ── Telegram ─────────────────────────────────────────────────
+# Get token from @BotFather, chat_id from @userinfobot
+TELEGRAM_BOT_TOKEN=123456789:AAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+TELEGRAM_CHAT_ID=-100xxxxxxxxxx
+# Optional: separate channel for trade alerts only (leave blank to use same chat)
+TELEGRAM_ALERT_CHAT_ID=
+
+# ── viaNexus Market & News API ───────────────────────────────
+VIANEXUS_API_KEY=vn_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+VIANEXUS_BASE_URL=https://api.vianexus.com/v1
+VIANEXUS_TIMEOUT=10
+
+# ── Symbols (comma-separated) ────────────────────────────────
+ALLOWED_SYMBOLS=["SOXL","TQQQ","QQQ","SOXX","NVDA"]
+
+# ── Risk Management ──────────────────────────────────────────
+MAX_POSITION_PCT=0.10       # Max 10% of portfolio in one position
+MAX_DAILY_LOSS_PCT=0.02     # Stop all signals if daily loss > 2%
+DEFAULT_STOP_PCT=0.05       # Default stop-loss = 5% below entry
+DEFAULT_TP1_MULT=1.5        # TP1 = stop_distance × 1.5
+DEFAULT_TP2_MULT=3.0        # TP2 = stop_distance × 3.0
+VOLATILITY_THRESHOLD=0.04   # Flag as volatile if daily range > 4%
+MIN_MOMENTUM_SCORE=40       # Skip signals with score below this
+
+# ── Cache TTLs ───────────────────────────────────────────────
+QUOTE_CACHE_TTL=30          # Quote cache: 30 seconds
+NEWS_CACHE_TTL=300          # News cache: 5 minutes[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+[environments.production]
+variables = { LOG_LEVEL = "INFO", DEBUG = "false" }{
+  "_readme": "Paste these JSON bodies into TradingView Alert → Message tab. Set Webhook URL to https://your-app.railway.app/webhook/tradingview and add header X-Webhook-Secret: <your_secret>",
+
+  "examples": [
+
+    {
+      "_label": "TQQQ — BUY signal with full indicators",
+      "symbol": "TQQQ",
+      "action": "BUY",
+      "price": "{{close}}",
+      "volume": "{{volume}}",
+      "timeframe": "{{interval}}",
+      "strategy": "EMA Crossover + RSI",
+      "indicators": {
+        "rsi":    "{{plot_0}}",
+        "ema20":  "{{plot_1}}",
+        "ema50":  "{{plot_2}}",
+        "atr":    "{{plot_3}}",
+        "macd":   "{{plot_4}}",
+        "signal": "{{plot_5}}"
+      }
+    },
+
+    {
+      "_label": "SOXL — SELL / exit signal",
+      "symbol": "SOXL",
+      "action": "SELL",
+      "price": "{{close}}",
+      "volume": "{{volume}}",
+      "timeframe": "{{interval}}",
+      "strategy": "Overbought RSI exit",
+      "indicators": {
+        "rsi":   "{{plot_0}}",
+        "ema20": "{{plot_1}}",
+        "ema50": "{{plot_2}}",
+        "atr":   "{{plot_3}}"
+      }
+    },
+
+    {
+      "_label": "QQQ — Simple BUY alert (minimal payload)",
+      "symbol": "QQQ",
+      "action": "BUY",
+      "price": "{{close}}",
+      "timeframe": "1D"
+    },
+
+    {
+      "_label": "SMH — ALERT (informational, no trade action)",
+      "symbol": "SMH",
+      "action": "ALERT",
+      "price": "{{close}}",
+      "timeframe": "4h",
+      "strategy": "Support level reached",
+      "indicators": {
+        "rsi":  "{{plot_0}}",
+        "atr":  "{{plot_1}}"
+      }
+    },
+
+    {
+      "_label": "TQQQ — CLOSE position signal",
+      "symbol": "TQQQ",
+      "action": "CLOSE",
+      "price": "{{close}}",
+      "timeframe": "{{interval}}",
+      "strategy": "Trailing stop hit"
+    },
+
+    {
+      "_label": "Static test payload (for curl / Postman testing)",
+      "symbol": "SOXL",
+      "action": "BUY",
+      "price": 32.50,
+      "volume": 5820000,
+      "timeframe": "1D",
+      "strategy": "RSI Oversold Bounce",
+      "indicators": {
+        "rsi":    28.4,
+        "ema20":  33.12,
+        "ema50":  35.77,
+        "atr":    1.84,
+        "macd":  -0.42,
+        "signal": -0.38
+      }
+    }
+
+  ],
+
+  "tradingview_pine_template": "// ── Paste in Pine Script alert() call ──\nalert(\n  '{\"symbol\": \"' + syminfo.ticker + '\", ' +\n  '\"action\": \"BUY\", ' +\n  '\"price\": ' + str.tostring(close) + ', ' +\n  '\"volume\": ' + str.tostring(volume) + ', ' +\n  '\"timeframe\": \"' + timeframe.period + '\", ' +\n  '\"indicators\": {' +\n    '\"rsi\": '   + str.tostring(rsi_val,   \"#.##\") + ', ' +\n    '\"ema20\": \" + str.tostring(ema20_val, \"#.####\") + ', ' +\n    '\"atr\": '   + str.tostring(atr_val,   \"#.####\") +\n  '}}',\n  alert.freq_once_per_bar_close\n)",
+
+  "curl_test": "curl -X POST https://your-app.railway.app/webhook/tradingview \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Webhook-Secret: your_secret_token_here' \\\n  -d '{\"symbol\":\"TQQQ\",\"action\":\"BUY\",\"price\":52.30,\"timeframe\":\"1D\",\"strategy\":\"Test\"}'"
+}
