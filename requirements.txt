@@ -3,3 +3,4 @@ uvicorn
 python-dotenv
 requests
 anthropic
+anthropic>=0.28.0
